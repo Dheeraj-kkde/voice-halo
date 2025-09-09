@@ -1,6 +1,15 @@
-import { Canvas } from "@react-three/fiber";
-import { Suspense } from "react";
+import { Canvas, useFrame } from "@react-three/fiber";
+import { Suspense, useRef } from "react";
+import * as THREE from "three";
 import ParticleHalo from "./ParticleHalo";
+
+const KPMG = {
+  bg: "radial-gradient(1200px at 50% 40%, #061333 0%, #05112b 55%, #010a20 100%)",
+  ringStart: "#00338D", // deep royal
+  ringEnd: "#005EB8", // KPMG blue
+  innerStart: "#6DA9FF", // light tint
+  innerEnd: "#3B5BA9", // mid blue
+};
 
 export default function App() {
   return (
@@ -11,50 +20,69 @@ export default function App() {
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        background:
-          "radial-gradient(1200px at 50% 40%, #0e1220 0%, #070a12 60%, #04060c 100%)",
+        background: KPMG.bg,
       }}
     >
       <Canvas
         style={{ width: 500, height: 500 }}
         dpr={[1, 2]}
-        gl={{ antialias: true }}
+        gl={{ antialias: true, powerPreference: "high-performance" }}
         camera={{ position: [0, 0, 6], fov: 50 }}
       >
-        <ambientLight intensity={0.6} />
-        <directionalLight position={[5, 5, 5]} intensity={0.8} />
+        {/* ambient just to avoid a super-flat feel (materials are additive anyway) */}
+        <ambientLight intensity={0.25} />
+        <directionalLight position={[4, 6, 8]} intensity={0.4} />
+
         <Suspense fallback={null}>
-          <ParticleHalo
-            // counts
-            ringCount={720}
-            innerCount={1800}
-            // ring look: *very thin*
-            ringRadius={2.0}
-            ringSize={0.028} // << smaller dots = thinner ring
-            ringColor="#cfe7ff"
-            ringGlow="#a7d0ff"
-            // inner look
-            innerSize={0.022}
-            innerColor="#b8d9ff"
-            innerGlow="#9ac7ff"
-            // motion
-            pulseStrength={0.08}
-            pulseSpeed={0.7}
-            waveSpeed={1.6}
-            waveCycles={3.0}
-            audioGain={0.85}
-            // inner flow baseline
-            innerFlowSpeed={0.65}
-            innerAudioJitter={0.5}
-            // NEW: gravity behaviour
-            gravityStrength={0.9} // how close toward center (0..1)
-            minCoreRadiusFrac={0.06} // don’t collapse to exact center (6% of ring radius)
-            activationSoftness={0.12} // smooth edge when recruiting particles
-            gammaLoudness={0.9} // map mic level -> recruitment (lower = recruit earlier)
-            autoStartMic={true}
-          />
+          <SceneDrift>
+            <ParticleHalo
+              // counts & layout
+              ringCount={720}
+              innerCount={900}
+              ringRadius={2.0}
+              ringSize={0.012} // thin core ring
+              featherSize={0.026} // soft outer halo ring (polish)
+              // palette
+              ringColorStart={KPMG.ringStart}
+              ringColorEnd={KPMG.ringEnd}
+              innerColorStart={KPMG.innerStart}
+              innerColorEnd={KPMG.innerEnd}
+              // motion
+              pulseStrength={0.085}
+              pulseSpeed={0.7}
+              waveSpeed={1.55}
+              waveCycles={3.0}
+              audioGain={0.9}
+              innerFlowSpeed={0.62}
+              innerAudioJitter={0.45}
+              // gravity + strict anti-cluster
+              gravityStrength={0.9}
+              minCoreRadiusFrac={0.06}
+              activationSoftness={0.12}
+              gammaLoudness={0.9}
+              vanishThresholdFrac={0.018}
+              vanishGuardFrac={0.012}
+              vanishJitterFrac={0.18}
+              reappearDelay={0.18}
+              respawnFadeIn={0.12}
+              autoStartMic={true}
+            />
+          </SceneDrift>
         </Suspense>
       </Canvas>
     </div>
   );
+}
+
+/** Subtle scene drift for a premium, “alive” feel */
+function SceneDrift({ children }: { children: React.ReactNode }) {
+  const ref = useRef<THREE.Group>(null!);
+  useFrame(() => {
+    const t = performance.now() * 0.001;
+    if (!ref.current) return;
+    ref.current.rotation.z = Math.sin(t * 0.08) * 0.02;
+    ref.current.rotation.x = Math.cos(t * 0.06) * 0.015;
+    ref.current.position.y = Math.sin(t * 0.5) * 0.02;
+  });
+  return <group ref={ref}>{children}</group>;
 }

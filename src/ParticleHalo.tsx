@@ -3,17 +3,19 @@ import { useMemo, useRef, useEffect } from "react";
 import { useFrame } from "@react-three/fiber";
 
 type Props = {
-  // counts
   ringCount?: number;
   innerCount?: number;
-  // sizes / colors
   ringRadius?: number;
   ringSize?: number;
+  featherSize?: number;
   innerSize?: number;
-  ringColor?: string;
-  innerColor?: string;
-  ringGlow?: string;
-  innerGlow?: string;
+
+  // If you passed ringColorStart/End before, we'll just use the END and lighten it.
+  ringColorStart?: string;
+  ringColorEnd?: string;
+  innerColorStart?: string;
+  innerColorEnd?: string;
+
   // motion
   pulseStrength?: number;
   pulseSpeed?: number;
@@ -22,45 +24,66 @@ type Props = {
   audioGain?: number;
   innerFlowSpeed?: number;
   innerAudioJitter?: number;
-  // gravity behaviour (NEW)
-  gravityStrength?: number; // 0..1 (1 = can pull all the way to center floor)
-  minCoreRadiusFrac?: number; // keep a tiny core radius (fraction of ringRadius)
-  activationSoftness?: number; // 0..0.5 – soft edge when recruiting particles
-  gammaLoudness?: number; // loudness curve; <1 recruits earlier, >1 later
-  // mic
+
+  // gravity
+  gravityStrength?: number;
+  minCoreRadiusFrac?: number;
+  activationSoftness?: number;
+  gammaLoudness?: number;
+
+  // strict anti-cluster
+  vanishThresholdFrac?: number;
+  vanishGuardFrac?: number;
+  vanishJitterFrac?: number;
+  reappearDelay?: number;
+  respawnFadeIn?: number;
+
   autoStartMic?: boolean;
 };
 
 export default function ParticleHalo({
   ringCount = 720,
-  innerCount = 1800,
+  innerCount = 900,
   ringRadius = 2.0,
-  ringSize = 0.028,
+  ringSize = 0.012,
+  featherSize = 0.026,
   innerSize = 0.022,
-  ringColor = "#cfe7ff",
-  innerColor = "#b8d9ff",
-  ringGlow = "#a7d0ff",
-  innerGlow = "#9ac7ff",
-  pulseStrength = 0.08,
+
+  ringColorStart = "#00338D",
+  ringColorEnd = "#005EB8",
+  innerColorStart = "#6DA9FF",
+  innerColorEnd = "#3B5BA9",
+
+  pulseStrength = 0.085,
   pulseSpeed = 0.7,
-  waveSpeed = 1.6,
+  waveSpeed = 1.55,
   waveCycles = 3.0,
-  audioGain = 0.85,
-  innerFlowSpeed = 0.65,
-  innerAudioJitter = 0.5,
+  audioGain = 0.9,
+  innerFlowSpeed = 0.62,
+  innerAudioJitter = 0.45,
+
   gravityStrength = 0.9,
   minCoreRadiusFrac = 0.06,
   activationSoftness = 0.12,
   gammaLoudness = 0.9,
+
+  vanishThresholdFrac = 0.018,
+  vanishGuardFrac = 0.012,
+  vanishJitterFrac = 0.18,
+  reappearDelay = 0.18,
+  respawnFadeIn = 0.12,
+
   autoStartMic = true,
 }: Props) {
-  const ringRef = useRef<THREE.InstancedMesh>(null!);
+  const ringCoreRef = useRef<THREE.InstancedMesh>(null!);
+  const ringFeatherRef = useRef<THREE.InstancedMesh>(null!);
   const innerRef = useRef<THREE.InstancedMesh>(null!);
+
   const dummy = useMemo(() => new THREE.Object3D(), []);
   const timeRef = useRef(0);
   const levelSmooth = useRef(0);
 
-  // ---- Microphone ----
+  /* ---------------- MIC ---------------- */
   const analyserRef = useRef<AnalyserNode | null>(null);
   const fftArrayRef = useRef<Uint8Array | null>(null);
 
@@ -96,7 +119,7 @@ export default function ParticleHalo({
     return sum / (take - 2) / 255;
   };
 
-  // ---- Ring layout (even angles) ----
+  /* ------------- STATIC LAYOUTS ------------- */
   const ringAngles = useMemo(
     () =>
       Float32Array.from(
@@ -106,7 +129,6 @@ export default function ParticleHalo({
     [ringCount]
   );
 
-  // ---- Inner initial positions: uniform in disc ----
   const innerBase = useMemo(() => {
     const arr = new Float32Array(innerCount * 2);
     const rng = mulberry32(987654);
@@ -121,19 +143,100 @@ export default function ParticleHalo({
     return arr;
   }, [innerCount, ringRadius]);
 
-  // ---- Inner recruitment order (stable) ----
-  // Each particle gets a rank in [0,1); lower ranks get recruited first as loudness rises.
+  // recruitment order + per-particle vanish jitter
   const innerRank = useMemo(() => {
     const order = new Float32Array(innerCount);
     const rng = mulberry32(24681357);
     for (let i = 0; i < innerCount; i++) order[i] = rng();
-    return order; // not sorted; we compare l^gamma vs rank directly
+    return order;
   }, [innerCount]);
 
+  const innerThreshJitter = useMemo(() => {
+    const arr = new Float32Array(innerCount);
+    const rng = mulberry32(13579);
+    for (let i = 0; i < innerCount; i++) arr[i] = rng() - 0.5;
+    return arr;
+  }, [innerCount]);
+
+  /* ------------- GEOMETRY & MATERIALS ------------- */
+  const ringGeo = useMemo(
+    () => new THREE.SphereGeometry(ringSize, 10, 10),
+    [ringSize]
+  );
+  const ringFeatherGeo = useMemo(
+    () => new THREE.SphereGeometry(featherSize, 10, 10),
+    [featherSize]
+  );
+  const innerGeo = useMemo(
+    () => new THREE.SphereGeometry(innerSize, 8, 8),
+    [innerSize]
+  );
+
+  // Build **solid light colors** (no vertexColors; fully deterministic)
+  const ringLight = useMemo(() => lighten(ringColorEnd, 0.35), [ringColorEnd]);
+  const featherLight = useMemo(
+    () => lighten(ringColorEnd, 0.55),
+    [ringColorEnd]
+  );
+  const innerLight = useMemo(
+    () => lighten(innerColorStart, 0.45),
+    [innerColorStart]
+  );
+
+  const ringMat = useMemo(
+    () =>
+      new THREE.MeshBasicMaterial({
+        color: new THREE.Color(ringLight),
+        transparent: true,
+        opacity: 0.95,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        toneMapped: false,
+      }),
+    [ringLight]
+  );
+
+  const featherMat = useMemo(
+    () =>
+      new THREE.MeshBasicMaterial({
+        color: new THREE.Color(featherLight),
+        transparent: true,
+        opacity: 0.18,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        toneMapped: false,
+      }),
+    [featherLight]
+  );
+
+  const innerMat = useMemo(
+    () =>
+      new THREE.MeshBasicMaterial({
+        color: new THREE.Color(innerLight),
+        transparent: true,
+        opacity: 0.85,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        toneMapped: false,
+      }),
+    [innerLight]
+  );
+
+  /* ------------- TIMERS ------------- */
+  const cooldownRef = useRef<Float32Array>();
+  if (!cooldownRef.current || cooldownRef.current.length !== innerCount) {
+    cooldownRef.current = new Float32Array(innerCount);
+  }
+  const respawnRef = useRef<Float32Array>();
+  if (!respawnRef.current || respawnRef.current.length !== innerCount) {
+    respawnRef.current = new Float32Array(innerCount);
+  }
+
+  /* ------------- FRAME LOOP ------------- */
   useFrame((_, delta) => {
     timeRef.current += delta;
 
-    // mic sampling + smoothing
+    // mic smoothing
     if (analyserRef.current && fftArrayRef.current) {
       analyserRef.current.getByteFrequencyData(fftArrayRef.current);
       const lvl = overallLevel();
@@ -146,151 +249,143 @@ export default function ParticleHalo({
       );
     }
 
-    // ----- RING: thin + wave pulse -----
+    // OUTER RING (core + feather)
     {
-      const inst = ringRef.current;
-      if (inst) {
-        const l = levelSmooth.current;
-        const globalPulse =
-          1 +
-          pulseStrength *
-            (0.35 +
-              0.65 *
-                (0.5 +
-                  0.5 * Math.sin(timeRef.current * pulseSpeed * Math.PI * 2)));
-        const wavePhase = timeRef.current * waveSpeed;
+      const l = levelSmooth.current;
+      const globalPulse =
+        1 +
+        pulseStrength *
+          (0.35 +
+            0.65 *
+              (0.5 +
+                0.5 * Math.sin(timeRef.current * pulseSpeed * Math.PI * 2)));
+      const wavePhase = timeRef.current * waveSpeed;
 
+      const updateRing = (
+        inst: THREE.InstancedMesh | null,
+        radiusScale = 1
+      ) => {
+        if (!inst) return;
         for (let i = 0; i < ringCount; i++) {
           const theta = ringAngles[i];
           const angularWave =
-            Math.sin(theta * waveCycles - wavePhase) * 0.5 + 0.5; // 0..1
+            Math.sin(theta * waveCycles - wavePhase) * 0.5 + 0.5;
           const audioOffset = audioGain * (0.2 * l + 0.6 * l * angularWave);
-          const r = ringRadius * globalPulse * (1 + 0.18 * audioOffset);
-          const x = Math.cos(theta) * r;
-          const y = Math.sin(theta) * r;
-
-          dummy.position.set(x, y, 0);
-          dummy.scale.setScalar(1); // keep dot size steady → visually thin ring
+          const r =
+            ringRadius * globalPulse * (1 + 0.18 * audioOffset) * radiusScale;
+          dummy.position.set(Math.cos(theta) * r, Math.sin(theta) * r, 0);
+          dummy.scale.setScalar(1);
           dummy.updateMatrix();
           inst.setMatrixAt(i, dummy.matrix);
         }
         inst.instanceMatrix.needsUpdate = true;
+      };
 
-        const mat = inst.material as THREE.MeshStandardMaterial;
-        // subtle emissive lift with loudness
-        // @ts-ignore
-        mat.emissiveIntensity = 0.7 + 0.8 * levelSmooth.current;
-      }
+      updateRing(ringCoreRef.current, 1.0);
+      updateRing(ringFeatherRef.current, 1.02);
     }
 
-    // ----- INNER: flow + *gravitational recruitment* -----
+    // INNER SWARM (strict no-center render + fade-in respawn)
     {
       const inst = innerRef.current;
       if (inst) {
         const t = timeRef.current;
         const l0 = levelSmooth.current;
-        // Map loudness through gamma (shapes how fast we recruit)
-        const loud = Math.pow(Math.min(Math.max(l0, 0), 1), gammaLoudness);
+        const loud = Math.pow(THREE.MathUtils.clamp(l0, 0, 1), gammaLoudness);
         const phase = t * innerFlowSpeed;
 
-        const minR = Math.max(minCoreRadiusFrac, 0.0) * ringRadius; // floor radius
+        const minR = Math.max(minCoreRadiusFrac, 0.0) * ringRadius;
+        const baseVanishR = Math.max(vanishThresholdFrac, 0.0) * ringRadius;
+        const guard = Math.max(vanishGuardFrac, 0) * ringRadius;
         const gStrength = THREE.MathUtils.clamp(gravityStrength, 0, 1);
 
+        const cooldown = cooldownRef.current!;
+        const respawn = respawnRef.current!;
+
         for (let i = 0; i < innerCount; i++) {
+          if (cooldown[i] > 0) {
+            cooldown[i] -= delta;
+            if (cooldown[i] <= 0) respawn[i] = respawnFadeIn;
+            const bx = innerBase[i * 2 + 0];
+            const by = innerBase[i * 2 + 1];
+            dummy.position.set(bx, by, 0);
+            dummy.scale.setScalar(0);
+            dummy.updateMatrix();
+            inst.setMatrixAt(i, dummy.matrix);
+            continue;
+          }
+
           const bx = innerBase[i * 2 + 0];
           const by = innerBase[i * 2 + 1];
-
           const baseR = Math.hypot(bx, by);
           const theta = Math.atan2(by, bx);
 
-          // traveling wave to add liveliness while gravitating
-          const wave = Math.sin(theta * waveCycles - t * waveSpeed) * 0.5 + 0.5;
-
-          // light flow field (organic motion)
           const nx =
             0.32 * Math.sin(0.85 * bx + 1.2 * by + phase) +
             0.18 * Math.cos(1.6 * by - 0.6 * bx + phase * 0.7);
           const ny =
             0.32 * Math.cos(0.95 * bx - 1.0 * by + phase) +
             0.18 * Math.sin(1.2 * bx + 0.8 * by + phase * 0.6);
-
-          // small tangential audio jitter to keep the inside alive
+          const wave = Math.sin(theta * waveCycles - t * waveSpeed) * 0.5 + 0.5;
           const j = innerAudioJitter * l0 * (0.25 + 0.75 * wave);
+
           let x = bx + nx * 0.07 + j * -Math.sin(theta);
           let y = by + ny * 0.07 + j * Math.cos(theta);
 
-          // ---- recruitment toward center ----
-          // Each particle has rank r in [0,1). If loud >= r → recruited.
-          // Use a soft band so recruitment looks smooth.
           const rnk = innerRank[i];
-          const s = activationSoftness; // softness width (0..0.5)
-          const a = smoothstep(rnk - s, rnk + s, loud); // 0..1 activation
+          const s = activationSoftness;
+          const a = smoothstep(rnk - s, rnk + s, loud);
 
-          // target radius when fully recruited (pulls toward minR)
           const targetR = THREE.MathUtils.lerp(baseR, minR, gStrength * a);
+          const jitter = innerThreshJitter[i] * vanishJitterFrac;
+          const vanishRi = baseVanishR * (1 + jitter) + guard;
+
+          if (a > 0.4 && targetR <= vanishRi) {
+            cooldown[i] = reappearDelay;
+            const bx2 = innerBase[i * 2 + 0];
+            const by2 = innerBase[i * 2 + 1];
+            dummy.position.set(bx2, by2, 0);
+            dummy.scale.setScalar(0);
+            dummy.updateMatrix();
+            inst.setMatrixAt(i, dummy.matrix);
+            continue;
+          }
+
           const ang = Math.atan2(y, x);
-          x = Math.cos(ang) * targetR;
-          y = Math.sin(ang) * targetR;
+          const rFinal = targetR;
+          x = Math.cos(ang) * rFinal;
+          y = Math.sin(ang) * rFinal;
+
+          let scale = 1 + 0.12 * a;
+          if (respawn[i] > 0) {
+            respawn[i] -= delta;
+            const k =
+              1 - Math.max(respawn[i], 0) / Math.max(respawnFadeIn, 0.0001);
+            scale *= THREE.MathUtils.clamp(k, 0, 1);
+            if (respawn[i] <= 0) respawn[i] = 0;
+          }
 
           dummy.position.set(x, y, 0);
-          // Slight size lift for recruited particles (visual feedback)
-          const sizeBoost = 1 + 0.5 * a * (0.3 + 0.7 * l0);
-          dummy.scale.setScalar(sizeBoost);
+          dummy.scale.setScalar(scale);
           dummy.updateMatrix();
           inst.setMatrixAt(i, dummy.matrix);
         }
-        inst.instanceMatrix.needsUpdate = true;
 
-        const mat = inst.material as THREE.MeshStandardMaterial;
-        // @ts-ignore
-        mat.emissiveIntensity = 0.55 + 0.75 * levelSmooth.current;
+        inst.instanceMatrix.needsUpdate = true;
       }
     }
   });
 
-  // ---- Geometries & materials ----
-  const ringGeo = useMemo(
-    () => new THREE.SphereGeometry(ringSize, 10, 10),
-    [ringSize]
-  );
-  const innerGeo = useMemo(
-    () => new THREE.SphereGeometry(innerSize, 8, 8),
-    [innerSize]
-  );
-
-  const ringMat = useMemo(() => {
-    const m = new THREE.MeshStandardMaterial({
-      color: new THREE.Color(ringColor),
-      emissive: new THREE.Color(ringGlow),
-      roughness: 0.25,
-      metalness: 0.1,
-      transparent: true,
-      opacity: 0.96,
-    });
-    // @ts-ignore
-    m.emissiveIntensity = 0.9;
-    return m;
-  }, [ringColor, ringGlow]);
-
-  const innerMat = useMemo(() => {
-    const m = new THREE.MeshStandardMaterial({
-      color: new THREE.Color(innerColor),
-      emissive: new THREE.Color(innerGlow),
-      roughness: 0.3,
-      metalness: 0.05,
-      transparent: true,
-      opacity: 0.96,
-    });
-    // @ts-ignore
-    m.emissiveIntensity = 0.6;
-    return m;
-  }, [innerColor, innerGlow]);
-
   return (
     <>
       <instancedMesh
-        ref={ringRef}
+        ref={ringCoreRef}
         args={[ringGeo, ringMat, ringCount]}
+        frustumCulled={false}
+      />
+      <instancedMesh
+        ref={ringFeatherRef}
+        args={[ringFeatherGeo, featherMat, ringCount]}
         frustumCulled={false}
       />
       <instancedMesh
@@ -302,7 +397,7 @@ export default function ParticleHalo({
   );
 }
 
-/* ---------- utils ---------- */
+/* ---------------- utils ---------------- */
 
 function mulberry32(a: number) {
   return function () {
@@ -313,8 +408,16 @@ function mulberry32(a: number) {
   };
 }
 
-// smoothstep(x0,x1,t) with clamped t
 function smoothstep(edge0: number, edge1: number, x: number) {
   const t = THREE.MathUtils.clamp((x - edge0) / (edge1 - edge0 || 1e-6), 0, 1);
   return t * t * (3 - 2 * t);
+}
+
+/** lighten a hex color by factor in [0..1] */
+function lighten(hex: string, factor = 0.3) {
+  const c = new THREE.Color(hex);
+  return new THREE.Color()
+    .copy(c)
+    .lerp(new THREE.Color("#ffffff"), THREE.MathUtils.clamp(factor, 0, 1))
+    .getStyle();
 }
