@@ -23,18 +23,19 @@ export default function App() {
       >
         <ambientLight intensity={0.6} />
         <directionalLight position={[5, 5, 5]} intensity={0.8} />
-
         <Suspense fallback={null}>
           <ParticleHalo
-            // appearance
-            ringCount={640}
-            innerCount={1600}
+            // counts
+            ringCount={720}
+            innerCount={1800}
+            // ring look: *very thin*
             ringRadius={2.0}
-            ringSize={0.06}
-            innerSize={0.028}
-            ringColor="#8ecbff"
+            ringSize={0.028} // << smaller dots = thinner ring
+            ringColor="#cfe7ff"
+            ringGlow="#a7d0ff"
+            // inner look
+            innerSize={0.022}
             innerColor="#b8d9ff"
-            ringGlow="#93c5fd"
             innerGlow="#9ac7ff"
             // motion
             pulseStrength={0.08}
@@ -42,8 +43,14 @@ export default function App() {
             waveSpeed={1.6}
             waveCycles={3.0}
             audioGain={0.85}
-            innerFlowSpeed={0.6} // organic flow of inner swarm
-            innerAudioJitter={0.6} // how strongly inner particles jitter with audio
+            // inner flow baseline
+            innerFlowSpeed={0.65}
+            innerAudioJitter={0.5}
+            // NEW: gravity behaviour
+            gravityStrength={0.9} // how close toward center (0..1)
+            minCoreRadiusFrac={0.06} // don’t collapse to exact center (6% of ring radius)
+            activationSoftness={0.12} // smooth edge when recruiting particles
+            gammaLoudness={0.9} // map mic level -> recruitment (lower = recruit earlier)
             autoStartMic={true}
           />
         </Suspense>

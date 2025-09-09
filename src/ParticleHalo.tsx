@@ -22,37 +22,45 @@ type Props = {
   audioGain?: number;
   innerFlowSpeed?: number;
   innerAudioJitter?: number;
+  // gravity behaviour (NEW)
+  gravityStrength?: number; // 0..1 (1 = can pull all the way to center floor)
+  minCoreRadiusFrac?: number; // keep a tiny core radius (fraction of ringRadius)
+  activationSoftness?: number; // 0..0.5 – soft edge when recruiting particles
+  gammaLoudness?: number; // loudness curve; <1 recruits earlier, >1 later
   // mic
   autoStartMic?: boolean;
 };
 
 export default function ParticleHalo({
-  ringCount = 640,
-  innerCount = 1600,
+  ringCount = 720,
+  innerCount = 1800,
   ringRadius = 2.0,
-  ringSize = 0.06,
-  innerSize = 0.028,
-  ringColor = "#8ecbff",
+  ringSize = 0.028,
+  innerSize = 0.022,
+  ringColor = "#cfe7ff",
   innerColor = "#b8d9ff",
-  ringGlow = "#93c5fd",
+  ringGlow = "#a7d0ff",
   innerGlow = "#9ac7ff",
   pulseStrength = 0.08,
   pulseSpeed = 0.7,
   waveSpeed = 1.6,
   waveCycles = 3.0,
   audioGain = 0.85,
-  innerFlowSpeed = 0.6,
-  innerAudioJitter = 0.6,
+  innerFlowSpeed = 0.65,
+  innerAudioJitter = 0.5,
+  gravityStrength = 0.9,
+  minCoreRadiusFrac = 0.06,
+  activationSoftness = 0.12,
+  gammaLoudness = 0.9,
   autoStartMic = true,
 }: Props) {
-  // ---------- Refs & helpers ----------
   const ringRef = useRef<THREE.InstancedMesh>(null!);
   const innerRef = useRef<THREE.InstancedMesh>(null!);
   const dummy = useMemo(() => new THREE.Object3D(), []);
   const timeRef = useRef(0);
   const levelSmooth = useRef(0);
 
-  // ---------- Microphone ----------
+  // ---- Microphone ----
   const analyserRef = useRef<AnalyserNode | null>(null);
   const fftArrayRef = useRef<Uint8Array | null>(null);
 
@@ -79,7 +87,6 @@ export default function ParticleHalo({
     if (autoStartMic) startMic();
   }, [autoStartMic]);
 
-  // a light-weight overall level (0..1) from FFT
   const overallLevel = () => {
     const fft = fftArrayRef.current;
     if (!fft) return 0;
@@ -89,7 +96,7 @@ export default function ParticleHalo({
     return sum / (take - 2) / 255;
   };
 
-  // ---------- Ring: even angle layout ----------
+  // ---- Ring layout (even angles) ----
   const ringAngles = useMemo(
     () =>
       Float32Array.from(
@@ -99,52 +106,51 @@ export default function ParticleHalo({
     [ringCount]
   );
 
-  // ---------- Inner: base positions (uniform disc) ----------
-  // Use r = R * sqrt(u) for uniform density, theta = 2πv
+  // ---- Inner initial positions: uniform in disc ----
   const innerBase = useMemo(() => {
-    const arr = new Float32Array(innerCount * 2); // x,y pairs
-    const rng = mulberry32(123456); // deterministic for stable layout
+    const arr = new Float32Array(innerCount * 2);
+    const rng = mulberry32(987654);
     for (let i = 0; i < innerCount; i++) {
       const u = rng();
       const v = rng();
-      const r = Math.sqrt(u) * (ringRadius * 0.98); // slightly inside ring
-      const theta = v * Math.PI * 2;
-      arr[i * 2 + 0] = Math.cos(theta) * r;
-      arr[i * 2 + 1] = Math.sin(theta) * r;
+      const r = Math.sqrt(u) * (ringRadius * 0.98);
+      const t = v * Math.PI * 2;
+      arr[i * 2 + 0] = Math.cos(t) * r;
+      arr[i * 2 + 1] = Math.sin(t) * r;
     }
     return arr;
   }, [innerCount, ringRadius]);
 
-  // small per-instance phase offsets to de-sync motion
-  const innerPhase = useMemo(() => {
-    const a = new Float32Array(innerCount);
-    const rng = mulberry32(424242);
-    for (let i = 0; i < innerCount; i++) a[i] = rng() * Math.PI * 2;
-    return a;
+  // ---- Inner recruitment order (stable) ----
+  // Each particle gets a rank in [0,1); lower ranks get recruited first as loudness rises.
+  const innerRank = useMemo(() => {
+    const order = new Float32Array(innerCount);
+    const rng = mulberry32(24681357);
+    for (let i = 0; i < innerCount; i++) order[i] = rng();
+    return order; // not sorted; we compare l^gamma vs rank directly
   }, [innerCount]);
 
-  // ---------- Frame loop ----------
   useFrame((_, delta) => {
     timeRef.current += delta;
 
-    // sample mic
+    // mic sampling + smoothing
     if (analyserRef.current && fftArrayRef.current) {
       analyserRef.current.getByteFrequencyData(fftArrayRef.current);
       const lvl = overallLevel();
       levelSmooth.current = THREE.MathUtils.lerp(levelSmooth.current, lvl, 0.1);
     } else {
-      // idle breathing if no mic
       levelSmooth.current = THREE.MathUtils.lerp(
         levelSmooth.current,
-        0.15 + 0.05 * Math.sin(timeRef.current * 0.8),
+        0.12 + 0.05 * Math.sin(timeRef.current * 0.8),
         0.05
       );
     }
 
-    // ----- RING -----
+    // ----- RING: thin + wave pulse -----
     {
       const inst = ringRef.current;
       if (inst) {
+        const l = levelSmooth.current;
         const globalPulse =
           1 +
           pulseStrength *
@@ -156,97 +162,93 @@ export default function ParticleHalo({
 
         for (let i = 0; i < ringCount; i++) {
           const theta = ringAngles[i];
-
-          // traveling wave around the ring, shaped by audio
           const angularWave =
             Math.sin(theta * waveCycles - wavePhase) * 0.5 + 0.5; // 0..1
-          const audioOffset =
-            audioGain *
-            (0.15 * levelSmooth.current +
-              0.55 * angularWave * levelSmooth.current);
-
-          const r = ringRadius * globalPulse * (1 + 0.25 * audioOffset);
+          const audioOffset = audioGain * (0.2 * l + 0.6 * l * angularWave);
+          const r = ringRadius * globalPulse * (1 + 0.18 * audioOffset);
           const x = Math.cos(theta) * r;
           const y = Math.sin(theta) * r;
 
           dummy.position.set(x, y, 0);
-          // subtle size wobble with audioOffset (keeps ring lively)
-          const s = 1 + 0.35 * audioOffset;
-          dummy.scale.setScalar(s);
-          dummy.lookAt(0, 0, 0);
+          dummy.scale.setScalar(1); // keep dot size steady → visually thin ring
           dummy.updateMatrix();
           inst.setMatrixAt(i, dummy.matrix);
         }
         inst.instanceMatrix.needsUpdate = true;
 
-        // emissive “glow” reacts to level
         const mat = inst.material as THREE.MeshStandardMaterial;
-        (mat.emissiveIntensity as any) = 0.6 + 0.9 * levelSmooth.current;
+        // subtle emissive lift with loudness
+        // @ts-ignore
+        mat.emissiveIntensity = 0.7 + 0.8 * levelSmooth.current;
       }
     }
 
-    // ----- INNER SWARM -----
+    // ----- INNER: flow + *gravitational recruitment* -----
     {
       const inst = innerRef.current;
       if (inst) {
         const t = timeRef.current;
+        const l0 = levelSmooth.current;
+        // Map loudness through gamma (shapes how fast we recruit)
+        const loud = Math.pow(Math.min(Math.max(l0, 0), 1), gammaLoudness);
         const phase = t * innerFlowSpeed;
-        const l = levelSmooth.current;
+
+        const minR = Math.max(minCoreRadiusFrac, 0.0) * ringRadius; // floor radius
+        const gStrength = THREE.MathUtils.clamp(gravityStrength, 0, 1);
 
         for (let i = 0; i < innerCount; i++) {
           const bx = innerBase[i * 2 + 0];
           const by = innerBase[i * 2 + 1];
 
-          // angle & radius from center (for coupling to ring wave)
-          const theta = Math.atan2(by, bx);
           const baseR = Math.hypot(bx, by);
+          const theta = Math.atan2(by, bx);
 
-          // traveling wave synced with ring
+          // traveling wave to add liveliness while gravitating
           const wave = Math.sin(theta * waveCycles - t * waveSpeed) * 0.5 + 0.5;
 
-          // organic “flow field” (cheap pseudo-noise)
-          const ph = innerPhase[i];
+          // light flow field (organic motion)
           const nx =
-            0.35 * Math.sin(0.85 * bx + 1.2 * by + phase + ph) +
-            0.2 * Math.cos(1.7 * by - 0.6 * bx + phase * 0.7 + ph * 0.5);
+            0.32 * Math.sin(0.85 * bx + 1.2 * by + phase) +
+            0.18 * Math.cos(1.6 * by - 0.6 * bx + phase * 0.7);
           const ny =
-            0.35 * Math.cos(0.95 * bx - 1.0 * by + phase + ph) +
-            0.2 * Math.sin(1.3 * bx + 0.8 * by + phase * 0.6 - ph * 0.3);
+            0.32 * Math.cos(0.95 * bx - 1.0 * by + phase) +
+            0.18 * Math.sin(1.2 * bx + 0.8 * by + phase * 0.6);
 
-          // audio-driven jitter (radial + tangential)
-          const audioJitter = innerAudioJitter * l;
-          const jr = audioJitter * (0.35 * wave + 0.65 * l); // more energetic near wave crest
-          const jtheta =
-            audioJitter * 0.4 * (Math.sin(t * 2.2 + ph) * 0.5 + 0.5);
+          // small tangential audio jitter to keep the inside alive
+          const j = innerAudioJitter * l0 * (0.25 + 0.75 * wave);
+          let x = bx + nx * 0.07 + j * -Math.sin(theta);
+          let y = by + ny * 0.07 + j * Math.cos(theta);
 
-          // apply offsets
-          // flow: small screen-space displacement
-          let x = bx + nx * 0.08 + jtheta * -Math.sin(theta);
-          let y = by + ny * 0.08 + jtheta * Math.cos(theta);
+          // ---- recruitment toward center ----
+          // Each particle has rank r in [0,1). If loud >= r → recruited.
+          // Use a soft band so recruitment looks smooth.
+          const rnk = innerRank[i];
+          const s = activationSoftness; // softness width (0..0.5)
+          const a = smoothstep(rnk - s, rnk + s, loud); // 0..1 activation
 
-          // radial breathing & audio pulse (keeps inside coherent with ring)
-          const radialScale =
-            1 + 0.05 * Math.sin(t * pulseSpeed * Math.PI * 2) + 0.12 * jr;
-          const rFinal = Math.min(baseR * radialScale, ringRadius * 0.98);
+          // target radius when fully recruited (pulls toward minR)
+          const targetR = THREE.MathUtils.lerp(baseR, minR, gStrength * a);
           const ang = Math.atan2(y, x);
-          x = Math.cos(ang) * rFinal;
-          y = Math.sin(ang) * rFinal;
+          x = Math.cos(ang) * targetR;
+          y = Math.sin(ang) * targetR;
 
           dummy.position.set(x, y, 0);
-          const s = 1 + 0.6 * l * (0.3 + 0.7 * wave);
-          dummy.scale.setScalar(s);
+          // Slight size lift for recruited particles (visual feedback)
+          const sizeBoost = 1 + 0.5 * a * (0.3 + 0.7 * l0);
+          dummy.scale.setScalar(sizeBoost);
           dummy.updateMatrix();
           inst.setMatrixAt(i, dummy.matrix);
         }
         inst.instanceMatrix.needsUpdate = true;
 
         const mat = inst.material as THREE.MeshStandardMaterial;
-        (mat.emissiveIntensity as any) = 0.45 + 0.8 * levelSmooth.current;
+        // @ts-ignore
+        mat.emissiveIntensity = 0.55 + 0.75 * levelSmooth.current;
       }
     }
   });
 
-  // ---------- Geometries & materials ----------
+  // ---- Geometries & materials ----
   const ringGeo = useMemo(
     () => new THREE.SphereGeometry(ringSize, 10, 10),
     [ringSize]
@@ -263,9 +265,9 @@ export default function ParticleHalo({
       roughness: 0.25,
       metalness: 0.1,
       transparent: true,
-      opacity: 0.95,
+      opacity: 0.96,
     });
-    // @ts-ignore – emissiveIntensity is available at runtime
+    // @ts-ignore
     m.emissiveIntensity = 0.9;
     return m;
   }, [ringColor, ringGlow]);
@@ -277,7 +279,7 @@ export default function ParticleHalo({
       roughness: 0.3,
       metalness: 0.05,
       transparent: true,
-      opacity: 0.95,
+      opacity: 0.96,
     });
     // @ts-ignore
     m.emissiveIntensity = 0.6;
@@ -286,13 +288,11 @@ export default function ParticleHalo({
 
   return (
     <>
-      {/* Outer pulsating ring */}
       <instancedMesh
         ref={ringRef}
         args={[ringGeo, ringMat, ringCount]}
         frustumCulled={false}
       />
-      {/* Inner lively swarm */}
       <instancedMesh
         ref={innerRef}
         args={[innerGeo, innerMat, innerCount]}
@@ -302,7 +302,8 @@ export default function ParticleHalo({
   );
 }
 
-/** Deterministic tiny RNG for stable inner layout */
+/* ---------- utils ---------- */
+
 function mulberry32(a: number) {
   return function () {
     let t = (a += 0x6d2b79f5);
@@ -310,4 +311,10 @@ function mulberry32(a: number) {
     t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
+}
+
+// smoothstep(x0,x1,t) with clamped t
+function smoothstep(edge0: number, edge1: number, x: number) {
+  const t = THREE.MathUtils.clamp((x - edge0) / (edge1 - edge0 || 1e-6), 0, 1);
+  return t * t * (3 - 2 * t);
 }
